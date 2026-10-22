@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import date, timedelta
 
 import streamlit as st
@@ -29,7 +30,12 @@ from google.genai import errors, types
 # Model names change often. Override with the GEMINI_MODEL secret/env variable
 # if Google retires or renames a model. The app tries the fallbacks in order.
 DEFAULT_MODEL = "gemini-3.8-flash"
-FALLBACK_MODELS = ["gemini-3.6-flash"]
+FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-flash-latest"]
+
+# New models are often "overloaded" (HTTP 503). We retry with a short wait, then
+# fall back to the next model instead of failing straight away.
+RETRYABLE_CODES = (500, 502, 503, 504)
+RETRY_DELAYS = [2, 5]  # seconds to wait before the 2nd and 3rd attempt per model
 
 MAX_DAYS = 21
 REQUEST_TIMEOUT_MS = 120_000
@@ -368,20 +374,36 @@ def build_prompt(inputs: dict) -> str:
     )
 
 
-def _friendly_api_error(exc: errors.APIError) -> str:
+def _api_detail(exc: Exception) -> str:
+    """Short, single-line detail from the API error, to help with debugging."""
+    msg = str(getattr(exc, "message", "") or "").strip().replace("\n", " ")
+    return msg[:200]
+
+
+def _friendly_api_error(exc: errors.APIError, tried: list[str] | None = None) -> str:
     code = getattr(exc, "code", None)
     text = str(exc).lower()
+    detail = _api_detail(exc)
+    suffix = f" (Google said: {detail})" if detail else ""
     if code in (401, 403) or "api key" in text:
-        return "The Gemini API key was rejected. Check that it is correct and has the Gemini API enabled."
+        return "The Gemini API key was rejected. Check that it is correct and has the Gemini API enabled." + suffix
     if code == 429:
-        return "Gemini rate limit or quota reached. Please wait a minute and try again."
-    if code in (500, 502, 503, 504):
-        return "The Gemini service is temporarily unavailable. Please try again shortly."
-    return f"The Gemini API returned an error (code {code}). Please try again."
+        return "Gemini rate limit or quota reached. Please wait a minute and try again." + suffix
+    if code in RETRYABLE_CODES:
+        models = f" Tried: {', '.join(tried)}." if tried else ""
+        return (
+            "The Gemini service is temporarily unavailable or overloaded." + models
+            + " Please wait a minute and try again." + suffix
+        )
+    return f"The Gemini API returned an error (code {code}). Please try again." + suffix
 
 
 def generate_itinerary(api_key: str, inputs: dict, models: list[str]) -> tuple[dict, str]:
-    """Call Gemini and return (normalized_itinerary, model_used)."""
+    """Call Gemini and return (normalized_itinerary, model_used).
+
+    Per model: retry with a short wait on overload (5xx), retry once on malformed JSON.
+    If a model is missing (404), overloaded, or rate-limited, move on to the next model.
+    """
     client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS))
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_INSTRUCTION,
@@ -390,14 +412,29 @@ def generate_itinerary(api_key: str, inputs: dict, models: list[str]) -> tuple[d
     prompt = build_prompt(inputs)
     start = date.fromisoformat(inputs["start_date"])
     last_parse_error = None
+    last_api_error = None
+    tried: list[str] = []
 
     for model in models:
-        for _attempt in range(2):  # retry once if the JSON is malformed
+        tried.append(model)
+        overload_retries = 0
+        parse_failures = 0
+        while True:
             try:
                 response = client.models.generate_content(model=model, contents=prompt, config=config)
             except errors.APIError as exc:
-                if getattr(exc, "code", None) == 404:
-                    break  # model not available -> try the next fallback
+                code = getattr(exc, "code", None)
+                if code in RETRYABLE_CODES:
+                    last_api_error = exc
+                    if overload_retries < len(RETRY_DELAYS):
+                        time.sleep(RETRY_DELAYS[overload_retries])
+                        overload_retries += 1
+                        continue
+                    break  # still failing -> next model
+                if code in (404, 429):
+                    if code == 429:
+                        last_api_error = exc
+                    break  # model missing or quota hit on this model -> next model
                 raise TripError(_friendly_api_error(exc)) from exc
             except Exception as exc:  # network errors, timeouts, etc.
                 raise TripError("Could not reach the Gemini service. Check your connection and try again.") from exc
@@ -407,9 +444,12 @@ def generate_itinerary(api_key: str, inputs: dict, models: list[str]) -> tuple[d
                 return data, model
             except (ValueError, TypeError) as exc:
                 last_parse_error = exc
-                continue
-        # either 404 on this model, or two bad parses: fall through to next model
+                parse_failures += 1
+                if parse_failures >= 2:
+                    break  # two bad answers -> next model
 
+    if last_api_error is not None:
+        raise TripError(_friendly_api_error(last_api_error, tried))
     if last_parse_error is not None:
         raise TripError("The AI returned an itinerary in an unexpected format. Please try again.")
     raise TripError(
