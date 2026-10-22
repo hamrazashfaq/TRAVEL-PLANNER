@@ -1,4 +1,3 @@
-# TRAVEL-PLANNER
 # 🧭 AI Travel Itinerary Planner
 
 A Streamlit app that creates a personalised travel itinerary with Google's Gemini Flash model. You enter a destination, budget, dates, interests and trip length, and it returns:
@@ -79,7 +78,7 @@ The app opens at <http://localhost:8501>.
 | Setting | Where | Purpose |
 |---|---|---|
 | `GEMINI_API_KEY` | secrets / env var | Your Gemini API key |
-| `GEMINI_MODEL` | secrets / env var (optional) | Override the model, e.g. `gemini-3.8-flash`. The default is `gemini-3.8-flash` with `gemini-3.6-flash` as a fallback |
+| `GEMINI_MODEL` | secrets / env var (optional) | Override the model, e.g. `gemini-3.8-flash`. The default is `gemini-3.8-flash`, with `gemini-3.6-flash` and `gemini-flash-latest` as automatic fallbacks |
 
 Gemini model names change often. If you see "None of the configured Gemini models are available", set `GEMINI_MODEL` to a current name from <https://ai.google.dev/gemini-api/docs/models>.
 
@@ -142,6 +141,7 @@ Anyone with the link can trigger requests using *your* key. To limit the risk:
 | Problem | Fix |
 |---|---|
 | "The Gemini API key was rejected" | Check the key, and that the Gemini API is enabled for it |
+| "temporarily unavailable or overloaded" | Google returned a 5xx error. The app already retries and tries fallback models. Wait a minute, or set `GEMINI_MODEL` to `gemini-3.6-flash` or `gemini-flash-latest` |
 | "rate limit or quota reached" | Wait a minute, or check your quota in Google AI Studio |
 | "None of the configured Gemini models are available" | Set `GEMINI_MODEL` to a current model name |
 | "unexpected format" | Click Generate again; the app already retries once automatically |
